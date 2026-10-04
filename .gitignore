@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+dist/
+build/
+.models-cache/
+ffmpeg/
+*.mp4
+*.zip
+screens-ci/
+selftest-out/

@@ -1,0 +1,125 @@
+# Build Body Swap (Windows x64 portable zip), test the packaged exe, publish a GitHub Release.
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Create / update the GitHub Release with the zip"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: "3.13"
+  PYTHONUTF8: "1"
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-win.txt
+
+      - name: Install Python deps
+        shell: pwsh
+        run: |
+          python -m pip install -U pip wheel
+          pip install -r requirements-win.txt
+          python -c "import onnxruntime, cv2, PySide6, numpy; print(onnxruntime.__version__, onnxruntime.get_available_providers(), cv2.__version__)"
+
+      - name: Download LGPL FFmpeg
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File packaging/download_ffmpeg.ps1
+
+      - name: Cache models
+        uses: actions/cache@v4
+        with:
+          path: .models-cache
+          key: models-bswap-v1-${{ hashFiles('bswap/models.py') }}
+
+      - name: Prefetch models
+        shell: pwsh
+        run: |
+          $env:BSWAP_MODELS = "$PWD\.models-cache"
+          python scripts/prefetch_models.py
+
+      - name: Fetch test clips
+        shell: pwsh
+        run: python scripts/fetch_test_clips.py clips
+
+      - name: PyInstaller
+        shell: pwsh
+        run: |
+          pyinstaller BodySwap.spec --noconfirm
+          New-Item -ItemType Directory -Force -Path dist/BodySwap/ffmpeg | Out-Null
+          Copy-Item ffmpeg/* dist/BodySwap/ffmpeg/ -Force
+
+      - name: Selftest packaged CLI
+        shell: pwsh
+        run: |
+          $out = "$PWD\selftest-out\cli"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          & dist\BodySwap\BodySwap_cli.exe --selftest `
+            --video clips\garden.mp4 --source clips\braids.mp4 `
+            --models "$PWD\.models-cache" --device cpu `
+            --start 4 --length 1.2 --fps 8 --max-short 480 --out $out --dml-smoke
+          if ($LASTEXITCODE -ne 0) { throw "selftest failed: $LASTEXITCODE" }
+          Get-Content "$out\selftest_report.json"
+
+      - name: DirectML failure stays on CPU
+        shell: pwsh
+        run: |
+          $out = "$PWD\selftest-out\dml-fallback"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $env:BSWAP_FORCE_DML_FAIL = "1"
+          & dist\BodySwap\BodySwap_cli.exe --test-dml-fallback --models "$PWD\.models-cache" --out $out
+          $code = $LASTEXITCODE
+          Remove-Item Env:BSWAP_FORCE_DML_FAIL -ErrorAction SilentlyContinue
+          Get-Content "$out\dml_fallback_report.json"
+          if ($code -ne 0) { throw "dml fallback failed: $code" }
+
+      - name: Make portable zip
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File packaging/make_zip.ps1
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $zip = Get-ChildItem dist\BodySwap-*-win64.zip | Select-Object -First 1
+          $ver = $zip.Name -replace '^BodySwap-(.+)-win64\.zip$', '$1'
+          $tag = if ("${{ github.ref }}".StartsWith("refs/tags/")) { "${{ github.ref_name }}" } else { "v$ver" }
+          $sha = (Get-FileHash $zip.FullName -Algorithm SHA256).Hash.ToLower()
+          $size = [math]::Round($zip.Length / 1MB, 1)
+          $notes = @"
+          Body Swap $ver for Windows x64 (ROG Ally X).
+
+          Whole visible person in a video, not face-only. Pose warp + person matte. Not a cloud generator.
+
+          - File: ``$($zip.Name)``
+          - Size: ${size} MB
+          - SHA-256: ``$sha``
+          - Models on first launch: ~24 MB into ``%LOCALAPPDATA%\BodySwap\models``
+          - SmartScreen: More info -> Run anyway
+
+          ``Get-FileHash .\$($zip.Name) -Algorithm SHA256``
+          "@
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $zip.FullName --clobber
+          } else {
+            gh release create $tag $zip.FullName --title "Body Swap for Windows v$ver" --notes $notes
+          }
